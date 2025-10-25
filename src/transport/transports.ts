@@ -86,44 +86,33 @@ export function setupStdioTransport(server: McpServer): Promise<void> {
 export function setupHttpTransport(server: McpServer, app: express.Application): Promise<void> {
   return new Promise((resolve, reject) => {
     try {
-      let transport: SSEServerTransport | null = null;
+      // --- Global middleware ---
+      app.use(cors()); // allow all origins for now
+      app.use(express.json({ limit: "2mb" }));
 
-      app.use(cors());  
-      app.use(express.json());
-
-      app.get("/sse", (req, res) => {
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        
-        transport = new SSEServerTransport("/messages", res);
-        
-        res.on("close", () => {
-          logger.info("SSE connection closed");
-          transport = null;
-        });
-        
-        server.connect(transport).catch(error => {
-          logger.error("Error connecting SSE transport:", error);
-          // reject(error);
-        });
+      // Simple request logger (see what the client hits)
+      app.use((req, _res, next) => {
+        logger.info(`${req.method} ${req.path}`);
+        next();
       });
 
-      app.options("/messages", cors());
-      app.post("/messages", cors(), (req, res) => {
-        if (transport) {
-          transport.handlePostMessage(req, res);
-        } else {
-          res.status(400).send('No active SSE connection found');
-        }
-      });
+      // --- Health & root ---
+      app.get("/", (_req, res) => res.send("Open Food Facts MCP Server is running"));
+      app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+      app.get("/health", (_req, res) => res.json({ status: "UP", version: "1.0.0" }));
 
+      // =======================
+      //   A) Streamable HTTP
+      // =======================
+      // Preflight
+      app.options("/mcp", cors());
+
+      // Single POST endpoint for Inspector / OpenAI Hosted MCP / Cursor (HTTP)
       app.post("/mcp", async (req, res) => {
         try {
-          const transport = new StreamableHTTPServerTransport({ 
-            enableJsonResponse: true, 
-            sessionIdGenerator: () => randomUUID(), 
+          const transport = new StreamableHTTPServerTransport({
+            enableJsonResponse: true,
+            sessionIdGenerator: () => randomUUID(),
           });
           res.on("close", () => transport.close());
           await server.connect(transport);
@@ -134,16 +123,47 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
         }
       });
 
-      app.get('/', (_, res) => {
-        res.send('Open Food Facts MCP Server is running');
+      // =======================
+      //   B) SSE transport
+      // =======================
+      let sseTransport: SSEServerTransport | null = null;
+
+      // SSE (server -> client)
+      app.get("/sse", (req, res) => {
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
+
+        sseTransport = new SSEServerTransport("/messages", res);
+
+        res.on("close", () => {
+          logger.info("SSE connection closed");
+          sseTransport = null;
+        });
+
+        // Do not reject on connect; SSE clients may reconnect
+        server.connect(sseTransport).catch(err => logger.error("SSE connect error:", err));
       });
 
-      app.get('/healthz', (_req, res) => res.status(200).send('ok'));
+      // Preflight for POST /messages
+      app.options("/messages", cors());
 
-      app.listen(PORT, '0.0.0.0', () => {
-        logger.info(`Open Food Facts MCP Server running on HTTP port ${PORT}`);
-        logger.info(`Use SSE endpoint at http://localhost:${PORT}/sse`);
-        logger.info(`Client-to-server messages should be POSTed to http://localhost:${PORT}/messages`);
+      // Client -> server messages
+      app.post("/messages", cors(), (req, res) => {
+        if (sseTransport) {
+          sseTransport.handlePostMessage(req, res);
+        } else {
+          res.status(400).send("No active SSE connection found");
+        }
+      });
+
+      // --- Single listener ---
+      app.listen(PORT, "0.0.0.0", () => {
+        logger.info(`MCP HTTP server listening on :${PORT}`);
+        logger.info(`Streamable HTTP: POST /mcp`);
+        logger.info(`SSE: GET /sse  |  POST /messages`);
         resolve();
       });
     } catch (error) {
