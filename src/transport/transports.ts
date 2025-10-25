@@ -110,10 +110,13 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
 
       // Handle POST requests (initialization and regular requests)
       app.post("/mcp", async (req, res) => {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        // Try to get session ID from headers (case-insensitive)
+        const sessionId = (req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id']) as string | undefined;
 
         if (sessionId) {
           logger.info(`Received MCP request for session: ${sessionId}`);
+        } else {
+          logger.info(`Received MCP request without session ID, body: ${JSON.stringify(req.body).substring(0, 200)}`);
         }
 
         try {
@@ -122,14 +125,17 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
           if (sessionId && transports[sessionId]) {
             // Reuse existing transport for this session
             transport = transports[sessionId];
+            logger.info(`Reusing existing transport for session: ${sessionId}`);
           } else if (!sessionId && isInitializeRequest(req.body)) {
             // New initialization request - create new transport
+            logger.info(`Creating new transport for initialization request`);
             transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => randomUUID(),
               enableJsonResponse: true,
               onsessioninitialized: (newSessionId: string) => {
                 logger.info(`Session initialized with ID: ${newSessionId}`);
                 transports[newSessionId] = transport;
+                logger.info(`Transport stored in map. Total active sessions: ${Object.keys(transports).length}`);
               }
             });
 
@@ -144,8 +150,21 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
 
             // Connect the transport to the MCP server
             await server.connect(transport);
+          } else if (sessionId && !transports[sessionId]) {
+            // Session ID provided but not found - this shouldn't happen normally
+            logger.error(`Session ID ${sessionId} not found. Active sessions: ${Object.keys(transports).join(', ')}`);
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: {
+                code: -32000,
+                message: `Bad Request: Session ${sessionId} not found or expired`
+              },
+              id: null
+            });
+            return;
           } else {
             // Invalid request - no session ID or not initialization request
+            logger.error(`Invalid request: sessionId=${sessionId}, isInit=${isInitializeRequest(req.body)}`);
             res.status(400).json({
               jsonrpc: '2.0',
               error: {
