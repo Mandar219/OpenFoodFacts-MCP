@@ -86,88 +86,40 @@ export function setupStdioTransport(server: McpServer): Promise<void> {
 export function setupHttpTransport(server: McpServer, app: express.Application): Promise<void> {
   return new Promise((resolve, reject) => {
     try {
-      // --- Global middleware ---
-      app.use(cors()); // allow all origins for now
+      app.use(cors());
       app.use(express.json({ limit: "2mb" }));
 
-      // Simple request logger (see what the client hits)
+      // Simple request logger so we can SEE if clients are hitting us
       app.use((req, _res, next) => {
         logger.info(`${req.method} ${req.path}`);
         next();
       });
 
-      // --- Health & root ---
       app.get("/", (_req, res) => res.send("Open Food Facts MCP Server is running"));
       app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-      app.get("/health", (_req, res) => res.json({ status: "UP", version: "1.0.0" }));
 
-      // =======================
-      //   A) Streamable HTTP
-      // =======================
-      // Preflight
+      // Allow preflight
       app.options("/mcp", cors());
 
-      app.get("/mcp", (req, res) => {
-        res.status(200).json({ message: "MCP endpoint ready" });
-      });
-
-      // Single POST endpoint for Inspector / OpenAI Hosted MCP / Cursor (HTTP)
-      app.post("/mcp", async (req, res) => {
+      app.all("/mcp", async (req, res) => {
         try {
           const transport = new StreamableHTTPServerTransport({
-            enableJsonResponse: true,
             sessionIdGenerator: () => randomUUID(),
+            enableJsonResponse: true,
           });
           res.on("close", () => transport.close());
           await server.connect(transport);
-          await transport.handleRequest(req, res, req.body);
+          // Pass req/res; body is optional (GET has none)
+          await transport.handleRequest(req, res, (req as any).body);
         } catch (err) {
           logger.error("Error handling /mcp request:", err);
           if (!res.headersSent) res.status(500).send("MCP server error");
         }
       });
 
-      // =======================
-      //   B) SSE transport
-      // =======================
-      let sseTransport: SSEServerTransport | null = null;
-
-      // SSE (server -> client)
-      app.get("/sse", (req, res) => {
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.setHeader("Access-Control-Allow-Headers", "content-type, authorization");
-
-        sseTransport = new SSEServerTransport("/messages", res);
-
-        res.on("close", () => {
-          logger.info("SSE connection closed");
-          sseTransport = null;
-        });
-
-        // Do not reject on connect; SSE clients may reconnect
-        server.connect(sseTransport).catch(err => logger.error("SSE connect error:", err));
-      });
-
-      // Preflight for POST /messages
-      app.options("/messages", cors());
-
-      // Client -> server messages
-      app.post("/messages", cors(), (req, res) => {
-        if (sseTransport) {
-          sseTransport.handlePostMessage(req, res);
-        } else {
-          res.status(400).send("No active SSE connection found");
-        }
-      });
-
-      // --- Single listener ---
       app.listen(PORT, "0.0.0.0", () => {
         logger.info(`MCP HTTP server listening on :${PORT}`);
-        logger.info(`Streamable HTTP: POST /mcp`);
-        logger.info(`SSE: GET /sse  |  POST /messages`);
+        logger.info(`Streamable HTTP endpoint: /mcp (GET + POST)`);
         resolve();
       });
     } catch (error) {
