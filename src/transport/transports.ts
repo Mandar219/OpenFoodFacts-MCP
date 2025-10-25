@@ -107,6 +107,10 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
       // Preflight
       app.options("/mcp", cors());
 
+      app.get("/mcp", (req, res) => {
+        res.status(200).json({ message: "MCP endpoint ready" });
+      });
+
       // Single POST endpoint for Inspector / OpenAI Hosted MCP / Cursor (HTTP)
       app.post("/mcp", async (req, res) => {
         try {
