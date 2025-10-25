@@ -116,11 +116,9 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
         res.send('Open Food Facts MCP Server is running');
       });
 
-      app.get('/health', (_, res) => {
-        res.json({ status: 'UP', version: '1.0.0' });
-      });
+      app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-      app.listen(PORT, () => {
+      app.listen(PORT, '0.0.0.0', () => {
         logger.info(`Open Food Facts MCP Server running on HTTP port ${PORT}`);
         logger.info(`Use SSE endpoint at http://localhost:${PORT}/sse`);
         logger.info(`Client-to-server messages should be POSTed to http://localhost:${PORT}/messages`);
