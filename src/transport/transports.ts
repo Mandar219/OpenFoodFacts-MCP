@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -85,6 +86,9 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
     try {
       let transport: SSEServerTransport | null = null;
 
+      app.use(cors());  
+      app.use(express.json());
+
       app.get("/sse", (req, res) => {
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Content-Type", "text/event-stream");
@@ -100,11 +104,12 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
         
         server.connect(transport).catch(error => {
           logger.error("Error connecting SSE transport:", error);
-          reject(error);
+          // reject(error);
         });
       });
 
-      app.post("/messages", express.json(), (req, res) => {
+      app.options("/messages", cors());
+      app.post("/messages", cors(), (req, res) => {
         if (transport) {
           transport.handlePostMessage(req, res);
         } else {
