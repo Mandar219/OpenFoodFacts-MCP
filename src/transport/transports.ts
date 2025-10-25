@@ -3,7 +3,9 @@ import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { PORT } from "../config/server-config.js";
+import { randomUUID } from "node:crypto";
 import fs from 'fs';
 import path from 'path';
 
@@ -114,6 +116,21 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
           transport.handlePostMessage(req, res);
         } else {
           res.status(400).send('No active SSE connection found');
+        }
+      });
+
+      app.post("/mcp", async (req, res) => {
+        try {
+          const transport = new StreamableHTTPServerTransport({ 
+            enableJsonResponse: true, 
+            sessionIdGenerator: () => randomUUID(), 
+          });
+          res.on("close", () => transport.close());
+          await server.connect(transport);
+          await transport.handleRequest(req, res, req.body);
+        } catch (err) {
+          logger.error("Error handling /mcp request:", err);
+          if (!res.headersSent) res.status(500).send("MCP server error");
         }
       });
 
