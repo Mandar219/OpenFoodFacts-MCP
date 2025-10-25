@@ -1,5 +1,5 @@
 {
-  "name": "@jagjeevan/openfoodfacts-mcp",
+  "name": "@mandar/openfoodfacts-mcp",
   "version": "1.0.3",
   "description": "Model Context Protocol server for Open Food Facts",
   "main": "dist/index.js",
