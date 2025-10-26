@@ -93,6 +93,31 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
       }));
       app.use(express.json({ limit: "2mb" }));
 
+      // Set request timeout to prevent hanging (2 minutes for regular requests)
+      app.use((req, res, next) => {
+        // Don't timeout SSE connections (GET requests to /mcp)
+        if (req.method === 'GET' && req.path === '/mcp') {
+          next();
+          return;
+        }
+
+        // Set 2 minute timeout for POST/DELETE
+        req.setTimeout(120000, () => {
+          logger.error(`Request timeout for ${req.method} ${req.path}`);
+          if (!res.headersSent) {
+            res.status(408).json({
+              jsonrpc: '2.0',
+              error: {
+                code: -32000,
+                message: 'Request timeout'
+              },
+              id: null
+            });
+          }
+        });
+        next();
+      });
+
       // Simple request logger so we can SEE if clients are hitting us
       app.use((req, _res, next) => {
         logger.info(`${req.method} ${req.path}`);
@@ -107,6 +132,31 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
 
       // Map to store transports by session ID
       const transports: Record<string, StreamableHTTPServerTransport> = {};
+      // Map to store session timeout timers
+      const sessionTimers: Record<string, NodeJS.Timeout> = {};
+      // Session timeout duration (5 minutes of inactivity)
+      const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
+
+      // Function to reset session timeout
+      const resetSessionTimeout = (sessionId: string) => {
+        // Clear existing timer
+        if (sessionTimers[sessionId]) {
+          clearTimeout(sessionTimers[sessionId]);
+        }
+
+        // Set new timer
+        sessionTimers[sessionId] = setTimeout(() => {
+          logger.info(`Session ${sessionId} timed out after ${SESSION_TIMEOUT_MS}ms of inactivity`);
+          const transport = transports[sessionId];
+          if (transport) {
+            transport.close().catch((err: Error) => {
+              logger.error(`Error closing timed-out session ${sessionId}:`, err);
+            });
+            delete transports[sessionId];
+          }
+          delete sessionTimers[sessionId];
+        }, SESSION_TIMEOUT_MS);
+      };
 
       // Handle POST requests (initialization and regular requests)
       app.post("/mcp", async (req, res) => {
@@ -126,6 +176,8 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
             // Reuse existing transport for this session
             transport = transports[sessionId];
             logger.info(`Reusing existing transport for session: ${sessionId}`);
+            // Reset the session timeout on activity
+            resetSessionTimeout(sessionId);
           } else if (!sessionId && isInitializeRequest(req.body)) {
             // New initialization request - create new transport
             logger.info(`Creating new transport for initialization request`);
@@ -136,15 +188,24 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
                 logger.info(`Session initialized with ID: ${newSessionId}`);
                 transports[newSessionId] = transport;
                 logger.info(`Transport stored in map. Total active sessions: ${Object.keys(transports).length}`);
+                // Start session timeout timer
+                resetSessionTimeout(newSessionId);
               }
             });
 
             // Set up cleanup handler
             transport.onclose = () => {
               const sid = transport.sessionId;
-              if (sid && transports[sid]) {
+              if (sid) {
                 logger.info(`Transport closed for session ${sid}, removing from transports map`);
-                delete transports[sid];
+                if (transports[sid]) {
+                  delete transports[sid];
+                }
+                // Clear the timeout timer
+                if (sessionTimers[sid]) {
+                  clearTimeout(sessionTimers[sid]);
+                  delete sessionTimers[sid];
+                }
               }
             };
 
@@ -195,12 +256,15 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
 
       // Handle GET requests (SSE streams)
       app.get("/mcp", async (req, res) => {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        const sessionId = (req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id']) as string | undefined;
 
         if (!sessionId || !transports[sessionId]) {
           res.status(400).send('Invalid or missing session ID');
           return;
         }
+
+        // Reset session timeout on SSE connection
+        resetSessionTimeout(sessionId);
 
         const lastEventId = req.headers['last-event-id'];
         if (lastEventId) {
@@ -222,7 +286,7 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
 
       // Handle DELETE requests (session termination)
       app.delete("/mcp", async (req, res) => {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        const sessionId = (req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id']) as string | undefined;
 
         if (!sessionId || !transports[sessionId]) {
           res.status(400).send('Invalid or missing session ID');
@@ -234,6 +298,14 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
         try {
           const transport = transports[sessionId];
           await transport.handleRequest(req, res);
+
+          // Clean up session after termination
+          if (sessionTimers[sessionId]) {
+            clearTimeout(sessionTimers[sessionId]);
+            delete sessionTimers[sessionId];
+          }
+          delete transports[sessionId];
+          logger.info(`Session ${sessionId} terminated and cleaned up`);
         } catch (err) {
           logger.error("Error handling session termination:", err);
           if (!res.headersSent) {
@@ -251,6 +323,14 @@ export function setupHttpTransport(server: McpServer, app: express.Application):
       // Handle server shutdown
       process.on('SIGINT', async () => {
         logger.info('Shutting down server...');
+
+        // Clear all session timers
+        for (const sessionId in sessionTimers) {
+          clearTimeout(sessionTimers[sessionId]);
+          delete sessionTimers[sessionId];
+        }
+
+        // Close all transports
         for (const sessionId in transports) {
           try {
             logger.info(`Closing transport for session ${sessionId}`);
